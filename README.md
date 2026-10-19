@@ -27,11 +27,22 @@ the UVD ring buffer controller intermittently isn't ready when the single-shot r
 
 ## The patch
 
-`drivers/gpu/drm/radeon/uvd_v1_0.c::uvd_v1_0_init()` — on failure of any init step
-(clock setup → VCPU start → ring test), do a full `uvd_v1_0_stop()` + 20 ms settle + retry,
-up to 3 attempts, with `drm_warn` diagnostics per attempt. On healthy hardware the first attempt
-succeeds and behaviour is unchanged; the retry only fires where the stock driver would have
-declared UVD dead.
+`drivers/gpu/drm/radeon/uvd_v1_0.c` (v3):
+
+1. `uvd_v1_0_init()` — silent warm-up cycle before anything else: raise UVD clocks,
+   `uvd_v1_0_start()`, `uvd_v1_0_stop()`, 20 ms settle — no ring test, no logging.
+   Field data showed the first ring instance after resume is dead *functionally*,
+   not by timeout: attempt 1 fails fast and deterministically, and only a full
+   stop+init cycle revives the engine (the Windows Catalyst driver does the same —
+   it silently reinitialises the engine instead of testing first).
+2. `uvd_v1_0_init()` — retry safety net kept from v1: on failure of any init step
+   (clock setup → VCPU start → ring test), full `uvd_v1_0_stop()` + 20 ms settle +
+   retry, up to 3 attempts, with `drm_warn` diagnostics per attempt.
+   `uvd_v1_0_stop()` is guarded behind successful clock setup, so no MMIO write
+   can ever reach an unclocked UVD block (Sashiko AI review, [PATCH v2] upstream).
+3. `uvd_v1_0_ring_test()` — the 2000 ms polling window from v2 is kept as spare
+   capacity (early-exit poll: healthy hardware still succeeds on the first µs-scale
+   check, so it costs nothing).
 
 Measured on the test machine: **stock 5/6, 3/6, 6/6, 2/6, 1/6 OK across runs (~50% median) →
 patched 6/6**, with the log showing the retry catching failures on attempt 2–3.

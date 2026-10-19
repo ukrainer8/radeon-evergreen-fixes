@@ -158,15 +158,26 @@ int uvd_v1_0_init(struct radeon_device *rdev)
 {
 	struct radeon_ring *ring = &rdev->ring[R600_RING_TYPE_UVD_INDEX];
 	uint32_t tmp;
-	int r, retry;
+	int r, retry, clk_err;
+
+	/* warm-up: silently cycle the engine once (like the Windows driver),
+	 * the first ring instance after resume is dead functionally */
+	if (rdev->family < CHIP_RV740)
+		radeon_set_uvd_clocks(rdev, 10000, 10000);
+	else
+		radeon_set_uvd_clocks(rdev, 53300, 40000);
+	uvd_v1_0_start(rdev);
+	uvd_v1_0_stop(rdev);
+	mdelay(20);
 
 	/* after resume the first ring test can race with the hardware; retry */
 	for (retry = 0; retry < 3; retry++) {
 		/* raise clocks while booting up the VCPU */
 		if (rdev->family < CHIP_RV740)
-			r = radeon_set_uvd_clocks(rdev, 10000, 10000);
+			clk_err = radeon_set_uvd_clocks(rdev, 10000, 10000);
 		else
-			r = radeon_set_uvd_clocks(rdev, 53300, 40000);
+			clk_err = radeon_set_uvd_clocks(rdev, 53300, 40000);
+		r = clk_err;
 		if (r)
 			drm_warn(&rdev->ddev, "radeon: raising UVD clocks failed (%d), attempt %d\n",
 				 r, retry + 1);
@@ -191,7 +202,9 @@ int uvd_v1_0_init(struct radeon_device *rdev)
 		if (!r)
 			break;
 
-		uvd_v1_0_stop(rdev);
+		/* MMIO is only safe when the block is actually clocked */
+		if (!clk_err)
+			uvd_v1_0_stop(rdev);
 		if (retry < 2)
 			mdelay(20);
 	}
@@ -442,7 +455,8 @@ void uvd_v1_0_stop(struct radeon_device *rdev)
 int uvd_v1_0_ring_test(struct radeon_device *rdev, struct radeon_ring *ring)
 {
 	uint32_t tmp = 0;
-	unsigned i;
+	/* after resume the ring buffer controller needs ~1.5-2s to settle */
+	unsigned i, timeout = 2000000;
 	int r;
 
 	WREG32(UVD_CONTEXT_ID, 0xCAFEDEAD);
@@ -455,14 +469,14 @@ int uvd_v1_0_ring_test(struct radeon_device *rdev, struct radeon_ring *ring)
 	radeon_ring_write(ring, PACKET0(UVD_CONTEXT_ID, 0));
 	radeon_ring_write(ring, 0xDEADBEEF);
 	radeon_ring_unlock_commit(rdev, ring, false);
-	for (i = 0; i < rdev->usec_timeout; i++) {
+	for (i = 0; i < timeout; i++) {
 		tmp = RREG32(UVD_CONTEXT_ID);
 		if (tmp == 0xDEADBEEF)
 			break;
 		udelay(1);
 	}
 
-	if (i < rdev->usec_timeout) {
+	if (i < timeout) {
 		drm_info(&rdev->ddev, "ring test on %d succeeded in %d usecs\n",
 			 ring->idx, i);
 	} else {
