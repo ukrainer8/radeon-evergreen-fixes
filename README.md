@@ -13,6 +13,9 @@ kernel update. Tested on Linux Mint 22.3 (Ubuntu noble base), kernel 7.0.0-38, R
 - After suspend-to-RAM or hibernate, hardware video decode (VA-API/VDPAU, UVD) is gone until reboot.
 - `dmesg` shows `radeon: ring 5 test failed (0xCAFEDEAD)` and `failed initializing UVD (-22)` on resume.
 - Cold boot always works; resume is a coin flip (~50% on our test machine, 42 measured cycles).
+- A second, rarer failure mode: init succeeds, but the first real command buffer
+  hangs — `fence wait timed out` + `failed testing IB on ring 5 (-110)`. The stock
+  driver then silently disables the UVD ring for the whole session.
 
 Known upstream, never fixed (radeon is in maintenance mode):
 [drm/amd#1867](https://gitlab.freedesktop.org/drm/amd/-/issues/1867),
@@ -39,16 +42,26 @@ prevented first-attempt failures, the guarded retry is what works.
 Measured on the test machine: **stock 5/6, 3/6, 6/6, 2/6, 1/6 OK across runs (~50% median) →
 patched 6/6**, with the log showing the retry catching failures on attempt 2–3.
 
-Raw patch for reviewers/upstream: [`patch/uvd_v1_0-retry.patch`](patch/uvd_v1_0-retry.patch).
+A second patch handles the IB-timeout mode above
+(`radeon_ib.c::radeon_ib_ring_tests()`): when the UVD ring's IB test fails with
+-110 after a seemingly-successful init, the block is restarted
+(`uvd_v1_0_stop()` + 20 ms + `uvd_v1_0_init()`, which retries its own ring test)
+and the IB is retested — up to 2 attempts — before the stock driver would
+permanently disable the ring. Observed in the field on 2026-10-30 after a ~46 h
+suspend; without the patch the only recovery was a reboot.
+
+Raw patches for reviewers/upstream:
+[`patch/uvd_v1_0-retry.patch`](patch/uvd_v1_0-retry.patch),
+[`patch/uvd-ib-retry.patch`](patch/uvd-ib-retry.patch).
 
 ## Install (DKMS)
 
 ```bash
 sudo apt install dkms linux-headers-$(uname -r)     # Debian/Ubuntu/Mint
-sudo cp -r radeon-uvd-resume-fix /usr/src/radeon-uvd-retry-1.0   # clone or unpack this repo
-sudo dkms add radeon-uvd-retry/1.0
-sudo dkms build radeon-uvd-retry/1.0
-sudo dkms install radeon-uvd-retry/1.0
+sudo cp -r radeon-uvd-resume-fix /usr/src/radeon-uvd-retry-1.5   # clone or unpack this repo
+sudo dkms add radeon-uvd-retry/1.5
+sudo dkms build radeon-uvd-retry/1.5
+sudo dkms install radeon-uvd-retry/1.5
 # verify: modinfo -n radeon should point into updates/dkms/
 ```
 
@@ -58,7 +71,7 @@ The patched module loads on the next reboot. Kernel updates rebuild it automatic
 ### Uninstall / rollback
 
 ```bash
-sudo dkms remove radeon-uvd-retry/1.0 --all && sudo depmod -a
+sudo dkms remove radeon-uvd-retry/1.5 --all && sudo depmod -a
 ```
 
 Stock driver takes over again; nothing else is touched. If a future kernel ever breaks the build,

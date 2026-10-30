@@ -33,6 +33,8 @@
 
 #include "radeon.h"
 
+#include "radeon_asic.h"
+
 /*
  * IB
  * IBs (Indirect Buffers) and areas of GPU accessible memory where
@@ -267,6 +269,28 @@ int radeon_ib_ring_tests(struct radeon_device *rdev)
 			continue;
 
 		r = radeon_ib_test(rdev, i, ring);
+		if (r && i == R600_RING_TYPE_UVD_INDEX) {
+			/* uvd_v1_0_init() retries its own ring test, but the
+			 * engine can still pass init and then stall on the
+			 * first real IB (-110, fence wait timed out).  Restart
+			 * the block and retest the IB a couple of times.
+			 */
+			int attempt;
+
+			for (attempt = 1; attempt <= 2 && r; attempt++) {
+				DRM_WARN("radeon: UVD IB test failed (%d), restarting UVD (attempt %d)\n",
+					 r, attempt);
+				radeon_fence_driver_force_completion(rdev, i);
+				uvd_v1_0_stop(rdev);
+				mdelay(20);
+				r = uvd_v1_0_init(rdev);
+				if (r) {
+					DRM_ERROR("radeon: UVD restart failed (%d)\n", r);
+					break;
+				}
+				r = radeon_ib_test(rdev, i, ring);
+			}
+		}
 		if (r) {
 			radeon_fence_driver_force_completion(rdev, i);
 			ring->ready = false;
